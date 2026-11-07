@@ -1,6 +1,6 @@
-# Git-backed memory for Claude Code: setup for a new project
+# Git-backed memory for Claude Code (and Kiro): setup for a new project
 
-Plain markdown in git, plus five hooks. No vector database, no memory server, no 2,000-line `CLAUDE.md`.
+Plain markdown in git, plus five hooks. The same files and hook scripts also work in Kiro (section 8). No vector database, no memory server, no 2,000-line `CLAUDE.md`.
 
 **The idea in one line:** keep *how to work* apart from *what happened*, keep both in git, have Claude read the right slice at the start and write back at the end.
 
@@ -193,9 +193,11 @@ export const NUDGE_IGNORE = ["docs/memory/", ".claude/.state/"];
 ### `.claude/hooks/lib.mjs`
 
 ```js
-// Shared helpers for the memory hooks.
+// Shared helpers for the memory hooks. Works for Claude Code (default) and Kiro (`--kiro` flag).
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
+
+export const KIRO = process.argv.includes("--kiro");
 
 export async function readInput() {
   let raw = "";
@@ -211,6 +213,41 @@ export const projectDir = (input = {}) => process.env.CLAUDE_PROJECT_DIR || inpu
 export const readText = (file) => (file && existsSync(file) ? readFileSync(file, "utf8") : "");
 export const rel = (root, file) => path.relative(root, file).split(path.sep).join("/");
 export const emit = (obj) => process.stdout.write(JSON.stringify(obj));
+
+// Tool input fields differ between tools and versions; try the known names.
+export const toolCommand = (input) => {
+  const t = input.tool_input ?? {};
+  return String(t.command ?? t.cmd ?? JSON.stringify(t));
+};
+export const toolFile = (input) => {
+  const t = input.tool_input ?? {};
+  return t.file_path ?? t.path ?? input.file_path ?? input.path;
+};
+export const promptText = (input) => input.prompt ?? process.env.USER_PROMPT ?? "";
+
+// Add text to the agent's context (prompt hooks).
+export function addContext(event, text) {
+  if (KIRO) process.stdout.write(text); // Kiro: stdout on exit 0 goes into context
+  else emit({ hookSpecificOutput: { hookEventName: event, additionalContext: text } });
+}
+
+// Send a problem back to the agent: after a write (fix it) or at stop (keep going).
+export function sendBack(event, reason) {
+  if (KIRO && event !== "Stop") {
+    process.stderr.write(reason); // Kiro: stderr on non-zero exit goes to the agent
+    process.exit(2);
+  }
+  emit({ decision: "block", reason }); // Claude Code, and Kiro V3 Stop hooks
+}
+
+// PreToolUse: "deny" blocks the tool; "ask" asks the human (Kiro has no ask, so it blocks).
+export function decideTool(decision, reason) {
+  if (KIRO) {
+    process.stderr.write(decision === "ask" ? `${reason} Ask the human to run it themselves.` : reason);
+    process.exit(2);
+  }
+  emit({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision, permissionDecisionReason: reason } });
+}
 
 // Skills used in this session, from the transcript (Skill tool calls and /slash commands).
 export function loadedSkills(transcriptPath) {
@@ -266,40 +303,46 @@ ${log.slice(-LOG_TAIL).join("\n") || "(empty)"}
 
 ```js
 // UserPromptSubmit: tell Claude which skill this request needs.
-import { readInput, emit } from "./lib.mjs";
+import { readInput, promptText, addContext } from "./lib.mjs";
 import { ROUTES } from "./config.mjs";
 
-const { prompt = "" } = await readInput();
+const prompt = promptText(await readInput());
 const hits = ROUTES.filter((r) => r.re.test(prompt)).map((r) => `\`${r.skill}\``);
 if (hits.length) {
-  emit({
-    hookSpecificOutput: {
-      hookEventName: "UserPromptSubmit",
-      additionalContext: `Router: load ${hits.join(" and ")} with the Skill tool before acting, unless already loaded this session.`,
-    },
-  });
+  addContext("UserPromptSubmit", `Router: load the ${hits.join(" and ")} skill before acting, unless already loaded this session.`);
 }
 ```
 
 ### `.claude/hooks/guard-command.mjs`
 
 ```js
-// PreToolUse (Bash|PowerShell): deny guarded commands until their skill is loaded; ask for risky ones.
-import { readInput, emit, loadedSkills } from "./lib.mjs";
+// PreToolUse (shell): deny guarded commands until their skill is loaded; ask for risky ones.
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { KIRO, readInput, projectDir, readText, toolCommand, decideTool, loadedSkills } from "./lib.mjs";
 import { GUARDS } from "./config.mjs";
 
 const input = await readInput();
-const cmd = String(input.tool_input?.command ?? "");
+const cmd = toolCommand(input);
 const guard = GUARDS.find((g) => g.re.test(cmd));
 if (!guard) process.exit(0);
 
-const decide = (permissionDecision, permissionDecisionReason) =>
-  emit({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision, permissionDecisionReason } });
-
-if (!loadedSkills(input.transcript_path).has(guard.skill)) {
-  decide("deny", `Load the \`${guard.skill}\` skill (Skill tool) and follow it before running this command.`);
-} else if (guard.ask?.test(cmd)) {
-  decide("ask", "Risky command (prod or destroy): the human must confirm.");
+if (guard.ask?.test(cmd)) {
+  decideTool("ask", "Risky command (prod or destroy): the human must confirm.");
+} else if (!KIRO && !loadedSkills(input.transcript_path).has(guard.skill)) {
+  decideTool("deny", `Load the \`${guard.skill}\` skill and follow it before running this command.`);
+} else if (KIRO) {
+  // Kiro gives hooks no transcript, so we can't see which skills are loaded. Instead, block the
+  // first attempt per session and hand the agent the skill text; the retry is allowed.
+  const root = projectDir(input);
+  const marker = path.join(root, ".claude", ".state", `guard-${guard.skill}-${input.session_id ?? new Date().toISOString().slice(0, 10)}`);
+  if (!readText(marker)) {
+    mkdirSync(path.dirname(marker), { recursive: true });
+    writeFileSync(marker, "shown");
+    const skill = readText(path.join(root, ".kiro", "skills", guard.skill, "SKILL.md")) ||
+      readText(path.join(root, ".claude", "skills", guard.skill, "SKILL.md"));
+    decideTool("deny", `Before running this, follow the \`${guard.skill}\` rules below, then retry.\n\n${skill}`);
+  }
 }
 ```
 
@@ -308,12 +351,12 @@ if (!loadedSkills(input.transcript_path).has(guard.skill)) {
 ```js
 // PostToolUse (Write|Edit|MultiEdit): flag known mistakes in the written file so Claude fixes them.
 import path from "node:path";
-import { readInput, projectDir, readText, rel, emit } from "./lib.mjs";
+import { readInput, projectDir, readText, rel, toolFile, sendBack } from "./lib.mjs";
 import { CHECKS, CHECK_EXEMPT } from "./config.mjs";
 
 const input = await readInput();
 const root = projectDir(input);
-const file = input.tool_input?.file_path;
+const file = toolFile(input);
 if (!file || !CHECKS.length) process.exit(0);
 
 const r = rel(root, path.resolve(root, file));
@@ -330,7 +373,7 @@ for (const c of CHECKS) {
   });
 }
 if (problems.length) {
-  emit({ decision: "block", reason: `Known-mistake check failed. Fix these now:\n${problems.join("\n")}` });
+  sendBack("PostToolUse", `Known-mistake check failed. Fix these now:\n${problems.join("\n")}`);
 }
 ```
 
@@ -342,7 +385,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { readInput, projectDir, readText, emit } from "./lib.mjs";
+import { readInput, projectDir, readText, sendBack } from "./lib.mjs";
 import { MEMORY_DIR, NUDGE_IGNORE } from "./config.mjs";
 
 const input = await readInput();
@@ -369,13 +412,12 @@ if (readText(marker).trim() === key) process.exit(0);
 mkdirSync(stateDir, { recursive: true });
 writeFileSync(marker, key);
 
-emit({
-  decision: "block",
-  reason:
-    `Files changed (${work.slice(0, 5).join(", ")}${work.length > 5 ? ", …" : ""}) but ${MEMORY_DIR}/log.md wasn't updated. ` +
+sendBack(
+  "Stop",
+  `Files changed (${work.slice(0, 5).join(", ")}${work.length > 5 ? ", …" : ""}) but ${MEMORY_DIR}/log.md wasn't updated. ` +
     "Append dated log lines and update Last status / Open tasks in the project card. " +
     "If this was exploratory or the changes aren't yours, say so in one line and stop.",
-});
+);
 ```
 
 ### `.claude/settings.json`
@@ -471,3 +513,76 @@ Set up git-backed memory for this repo following docs/CLAUDE-MEMORY-SETUP.md fro
 4. Add the Memory section to CLAUDE.md and the .gitignore lines.
 5. Test each hook with sample stdin and show me the output. Don't commit until I say so.
 ```
+
+---
+
+## 8. Using it with Kiro
+
+Kiro (IDE 1.0+, CLI V3+) has the same building blocks, so one repo can serve both tools. The memory files are shared, the skills are copied, and the same hook scripts run with a `--kiro` flag.
+
+| Piece | Claude Code | Kiro |
+|---|---|---|
+| Memory files | `docs/memory/` | Same files |
+| Always-on instructions | `CLAUDE.md` | `AGENTS.md` at the repo root (always included), or `.kiro/steering/*.md` with `inclusion: always` |
+| Job skills | `.claude/skills/<job>/SKILL.md` | `.kiro/skills/<job>/SKILL.md`, same Agent Skills format (`name` must match the folder) |
+| Hook wiring | `.claude/settings.json` | `.kiro/hooks/memory.json` |
+| Hook scripts | `.claude/hooks/*.mjs` | The same scripts, run with `--kiro` |
+
+### Shared instructions
+
+Put the Memory section (section 2) and anything else both tools need in `AGENTS.md`. Then make `CLAUDE.md` import it, so there's one source:
+
+```markdown
+@AGENTS.md
+
+<Claude-only notes, if any>
+```
+
+### Skills
+
+Copy each skill folder: `.claude/skills/deploy/` → `.kiro/skills/deploy/`. Kiro loads a skill when the request matches its `description`, or when you type `/deploy`. Keep the two copies in step, or keep one folder and have a small script copy it.
+
+### `.kiro/hooks/memory.json`
+
+Kiro runs hook commands from the project root.
+
+```json
+{
+  "version": "v1",
+  "hooks": [
+    { "name": "memory-card", "trigger": "SessionStart",
+      "action": { "type": "command", "command": "node .claude/hooks/session-start.mjs --kiro" } },
+    { "name": "memory-card-after-compaction", "trigger": "PostCompact",
+      "action": { "type": "command", "command": "node .claude/hooks/session-start.mjs --kiro" } },
+    { "name": "skill-router", "trigger": "UserPromptSubmit",
+      "action": { "type": "command", "command": "node .claude/hooks/route-prompt.mjs --kiro" } },
+    { "name": "command-guard", "trigger": "PreToolUse", "matcher": "shell",
+      "action": { "type": "command", "command": "node .claude/hooks/guard-command.mjs --kiro" } },
+    { "name": "known-mistakes", "trigger": "PostToolUse", "matcher": "write",
+      "action": { "type": "command", "command": "node .claude/hooks/check-written.mjs --kiro" } },
+    { "name": "log-nudge", "trigger": "Stop",
+      "action": { "type": "command", "command": "node .claude/hooks/stop-nudge.mjs --kiro" } }
+  ]
+}
+```
+
+### What `--kiro` changes
+
+| Hook | Claude Code | Kiro |
+|---|---|---|
+| session-start | stdout goes into context | Same |
+| route-prompt | Reads `prompt` from stdin; returns `additionalContext` JSON | Reads the `USER_PROMPT` env var; prints plain text (stdout on exit 0 goes into context). Kiro also matches skills by description, so this hook is optional there. |
+| guard-command | Denies until the skill appears in the transcript; asks the human for prod/destroy | Kiro gives hooks no transcript, so the **first** guarded command in a session is blocked and the skill text is sent to the agent; the retry is allowed. Prod/destroy is always blocked (Kiro has no "ask"), so you run those yourself. |
+| check-written | Returns `{"decision":"block"}` | Exits 2; stderr goes to the agent |
+| stop-nudge | Returns `{"decision":"block"}` | Same JSON (Kiro V3 Stop hooks continue the session on it) |
+
+The scripts try the known names for tool inputs (`command`/`cmd`, `file_path`/`path`), because Kiro's built-in tool fields aren't fully documented.
+
+### First run in Kiro: check it
+
+1. Start a session and ask "what's the status of this project?". It should answer from the card.
+2. Ask it to run a guarded command (for example a dev deploy). The first attempt should be blocked with the skill text.
+3. Have it write a file that breaks one of your `CHECKS`. It should fix it.
+4. If a hook does nothing, check what Kiro sends: temporarily point that hook's command at `node -e "process.stdin.pipe(process.stdout)"` (or write stdin to a file), then add any missing field name to `toolCommand` / `toolFile` in `lib.mjs`.
+
+Kiro's docs: [hooks](https://kiro.dev/docs/hooks/), [triggers](https://kiro.dev/docs/hooks/types/), [actions](https://kiro.dev/docs/hooks/actions/), [steering](https://kiro.dev/docs/steering/), [skills](https://kiro.dev/docs/skills/).
